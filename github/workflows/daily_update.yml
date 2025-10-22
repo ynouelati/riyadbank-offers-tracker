@@ -2,7 +2,7 @@ name: Daily Offer Update
 
 on:
   schedule:
-    - cron: "0 3 * * *"  # every day at 3am UTC
+    - cron: "0 3 * * *"  # runs daily at 03:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -10,8 +10,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repository
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,4 +26,5 @@ jobs:
       - name: Run scraper
         env:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: python riyad_offers_scraper.py
