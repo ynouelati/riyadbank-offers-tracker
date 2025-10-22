@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import requests
 from bs4 import BeautifulSoup
@@ -6,77 +7,120 @@ import gspread
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 
-# --- CONFIG ---
+# =========================
+# CONFIGURATION
+# =========================
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SHEET_NAME = "Offers"
 
-def get_offers_from_page(url, category, card_type):
-    """Fetches offers from a single page."""
-    res = requests.get(url)
-    soup = BeautifulSoup(res.text, "html.parser")
+BASE_CREDIT_URL = "https://www.riyadbank.com/personal-banking/credit-cards/offers/"
+CATEGORIES = [
+    "fashion",
+    "lifestyle",
+    "dining",
+    "travel",
+    "health",
+    "entertainment",
+    "hotels"
+]
+MADA_URL = "https://www.riyadbank.com/personal-banking/debit-card/offers"
 
+
+# =========================
+# FUNCTIONS
+# =========================
+
+def fetch_page(url):
+    """Fetches and returns a BeautifulSoup object for a given URL."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        return BeautifulSoup(response.text, "html.parser")
+    except Exception as e:
+        print(f"❌ Error fetching {url}: {e}")
+        return None
+
+
+def extract_offers_from_page(soup, category, card_type):
+    """Extracts offers data from a given category page."""
     offers = []
-    # Find "Learn more" links to locate offer blocks
-    links = soup.find_all("a", string=lambda t: t and "Learn more" in t)
-    for link in links:
-        section = link.find_parent()
-        text = section.get_text(" ", strip=True)
-        merchant = ""
-        offer = ""
-        valid_until = ""
-        description = ""
+    if not soup:
+        return offers
 
-        # Simple heuristic to split out merchant and offer
-        parts = text.split("Valid until")
-        if len(parts) > 1:
-            valid_until = parts[1].split()[0]
-        if len(parts) > 0:
-            main = parts[0]
-            if "Off" in main:
-                offer = main
-            merchant = main.split("Off")[0].strip()
+    offer_blocks = soup.find_all(["div", "article"], class_=re.compile("(offer|promo|card|merchant)", re.I))
+    if not offer_blocks:
+        offer_blocks = soup.find_all("a", string=re.compile("Learn more", re.I))
+
+    for block in offer_blocks:
+        text = block.get_text(" ", strip=True)
+        if not text:
+            continue
+
+        merchant = None
+        offer_text = None
+        validity = None
+
+        # Extract merchant name
+        match_merchant = re.search(r"([A-Z][A-Za-z&'\- ]{2,})", text)
+        if match_merchant:
+            merchant = match_merchant.group(1).strip()
+
+        # Extract discount or deal
+        match_offer = re.search(r"(\d+%|\$\d+|off|discount|cashback)", text, re.I)
+        if match_offer:
+            offer_text = match_offer.group(0).strip()
+
+        # Extract validity
+        match_valid = re.search(r"Valid\s+until\s+([\d\-/\.A-Za-z]+)", text)
+        if match_valid:
+            validity = match_valid.group(1).strip()
+
+        link_tag = block.find("a", href=True)
+        link = link_tag["href"] if link_tag else ""
 
         offers.append({
-            "Category": category,
-            "Merchant": merchant,
-            "Offer": offer,
-            "Valid Until": valid_until,
-            "Description": description,
+            "Category": category.title(),
+            "Merchant": merchant or "N/A",
+            "Offer": offer_text or text[:60] + "...",
+            "Valid Until": validity or "N/A",
+            "Description": text,
             "Card Type": card_type,
-            "Learn More": link["href"],
-            "Source URL": url,
+            "Learn More": link,
+            "Source URL": soup.base.get("href") if soup.base else "",
             "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M")
         })
+    print(f"✅ {len(offers)} offers found in {category} ({card_type})")
     return offers
 
-def get_all_offers():
-    """Scrapes all credit-card and mada-card offer pages."""
-    base_credit = "https://www.riyadbank.com/personal-banking/credit-cards/offers/"
-    categories = [
-        "fashion", "lifestyle", "dining", "travel",
-        "health", "entertainment", "hotels"
-    ]
-    offers = []
-    for cat in categories:
-        offers += get_offers_from_page(base_credit + cat, cat.title(), "Credit Card")
 
-    # Add Mada offers page
-    mada_url = "https://www.riyadbank.com/personal-banking/debit-card/offers"
-    try:
-        offers += get_offers_from_page(mada_url, "All", "Mada Debit")
-    except Exception:
-        pass
+def scrape_all_offers():
+    """Scrapes all Credit and Mada offers."""
+    all_offers = []
+    for category in CATEGORIES:
+        url = BASE_CREDIT_URL + category
+        soup = fetch_page(url)
+        offers = extract_offers_from_page(soup, category, "Credit Card")
+        all_offers.extend(offers)
 
-    return offers
+    # Mada Debit Offers
+    mada_soup = fetch_page(MADA_URL)
+    all_offers.extend(extract_offers_from_page(mada_soup, "Mada", "Mada Debit"))
+    print(f"🔍 Total offers scraped: {len(all_offers)}")
+    return all_offers
+
 
 def write_to_sheet(offers):
-    """Writes the offers to the Google Sheet."""
-    # Load service-account credentials from secret
-    json_key = os.getenv("GOOGLE_CREDENTIALS_JSON")
-    if not json_key:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON environment variable not set")
-    creds_dict = json.loads(json_key)
-    # Include scopes for Sheets and Drive API access
+    """Writes offers to Google Sheet."""
+    if not offers:
+        print("⚠️ No offers to write.")
+        return
+
+    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if not creds_json:
+        raise ValueError("Missing GOOGLE_CREDENTIALS_JSON environment variable")
+
+    creds_dict = json.loads(creds_json)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
@@ -84,39 +128,29 @@ def write_to_sheet(offers):
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
 
-    # Open the sheet by ID
     sh = gc.open_by_key(SHEET_ID)
-
-    # Create or clear the target worksheet
     try:
-        worksheet = sh.worksheet(SHEET_NAME)
-        worksheet.clear()
-    except Exception:
-        worksheet = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=9)
+        ws = sh.worksheet(SHEET_NAME)
+        ws.clear()
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=9)
 
     headers = [
         "Category", "Merchant", "Offer", "Valid Until", "Description",
         "Card Type", "Learn More", "Source URL", "Last Updated"
     ]
-    worksheet.append_row(headers)
+    ws.append_row(headers)
+    ws.append_rows([
+        [
+            o["Category"], o["Merchant"], o["Offer"], o["Valid Until"],
+            o["Description"], o["Card Type"], o["Learn More"],
+            o["Source URL"], o["Last Updated"]
+        ]
+        for o in offers
+    ])
+    print(f"✅ Sheet updated successfully with {len(offers)} offers.")
 
-    for offer in offers:
-        worksheet.append_row([
-            offer["Category"],
-            offer["Merchant"],
-            offer["Offer"],
-            offer["Valid Until"],
-            offer["Description"],
-            offer["Card Type"],
-            offer["Learn More"],
-            offer["Source URL"],
-            offer["Last Updated"]
-        ])
 
 if __name__ == "__main__":
-    offers = get_all_offers()
-    if offers:
-        write_to_sheet(offers)
-        print(f"✅ {len(offers)} offers updated successfully!")
-    else:
-        print("⚠️ No offers found or scraping failed.")
+    offers = scrape_all_offers()
+    write_to_sheet(offers)
